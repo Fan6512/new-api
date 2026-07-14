@@ -32,6 +32,14 @@ var (
 	ErrUnaProvisionInvalid  = errors.New("una token provision request invalid")
 )
 
+type UnaRecoveryExpiredError struct {
+	ExternalID string
+}
+
+func (e *UnaRecoveryExpiredError) Error() string { return ErrUnaRecoveryExpired.Error() }
+
+func (e *UnaRecoveryExpiredError) Unwrap() error { return ErrUnaRecoveryExpired }
+
 type UnaTokenProvisioner struct {
 	DB          *gorm.DB
 	KEK         []byte
@@ -127,6 +135,26 @@ func (p *UnaTokenProvisioner) Create(ctx context.Context, idempotencyKey string,
 	return p.replayWithFlag(created, fingerprint, !createdNew)
 }
 
+func (p *UnaTokenProvisioner) Recover(ctx context.Context, idempotencyKey string, req dto.UnaTokenProvisionRequest) (dto.UnaTokenProvisionResponse, error) {
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	req.Name = strings.TrimSpace(req.Name)
+	if err := validateUnaProvisionRequest(idempotencyKey, req); err != nil {
+		return dto.UnaTokenProvisionResponse{}, err
+	}
+	if p == nil || p.DB == nil || len(p.KEK) != 32 || p.KEKVersion == "" || p.Now == nil {
+		return dto.UnaTokenProvisionResponse{}, errors.New("una token provisioner is not configured")
+	}
+	fingerprint, err := unaRequestFingerprint(req)
+	if err != nil {
+		return dto.UnaTokenProvisionResponse{}, err
+	}
+	existing, err := p.find(ctx, idempotencyKey)
+	if err != nil {
+		return dto.UnaTokenProvisionResponse{}, err
+	}
+	return p.replay(existing, fingerprint)
+}
+
 func (p *UnaTokenProvisioner) Disable(ctx context.Context, tokenID int) (dto.UnaTokenDisableResponse, error) {
 	if tokenID <= 0 {
 		return dto.UnaTokenDisableResponse{}, ErrUnaProvisionInvalid
@@ -153,7 +181,7 @@ func (p *UnaTokenProvisioner) replayWithFlag(provision model.UnaTokenProvision, 
 		return dto.UnaTokenProvisionResponse{}, ErrUnaProvisionConflict
 	}
 	if p.Now().UTC().Unix() > provision.RecoverableUntil {
-		return dto.UnaTokenProvisionResponse{}, ErrUnaRecoveryExpired
+		return dto.UnaTokenProvisionResponse{}, &UnaRecoveryExpiredError{ExternalID: strconv.Itoa(provision.TokenId)}
 	}
 	body, err := p.decrypt(provision)
 	if err != nil {

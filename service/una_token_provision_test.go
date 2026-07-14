@@ -110,11 +110,54 @@ func TestUnaTokenProvisionConflictAndExpiry(t *testing.T) {
 	*now = now.Add(25 * time.Hour)
 	if _, err := provisioner.Create(ctx, "idem-conflict", validUnaProvisionRequest()); !errors.Is(err, ErrUnaRecoveryExpired) {
 		t.Fatalf("expiry err=%v", err)
+	} else {
+		var expired *UnaRecoveryExpiredError
+		if !errors.As(err, &expired) || expired.ExternalID == "" {
+			t.Fatalf("expiry error lacks external id: %v", err)
+		}
 	}
 	var tokenCount int64
 	_ = db.Model(&model.Token{}).Count(&tokenCount).Error
 	if tokenCount != 1 {
 		t.Fatalf("expiry created a second token: %d", tokenCount)
+	}
+}
+
+func TestUnaTokenProvisionRecoverOnlyNeverCreates(t *testing.T) {
+	provisioner, db, now := newUnaProvisionerForTest(t)
+	ctx := context.Background()
+	request := validUnaProvisionRequest()
+
+	if _, err := provisioner.Recover(ctx, "idem-missing", request); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("missing recovery err=%v", err)
+	}
+	var tokenCount int64
+	if err := db.Model(&model.Token{}).Count(&tokenCount).Error; err != nil || tokenCount != 0 {
+		t.Fatalf("recover-only created token: count=%d err=%v", tokenCount, err)
+	}
+
+	created, err := provisioner.Create(ctx, "idem-recover", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := provisioner.Recover(ctx, "idem-recover", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered.Replayed || recovered.ExternalID != created.ExternalID || recovered.RawKey != created.RawKey {
+		t.Fatalf("unexpected recovery: %+v", recovered)
+	}
+	changed := request
+	changed.Name = "different"
+	if _, err := provisioner.Recover(ctx, "idem-recover", changed); !errors.Is(err, ErrUnaProvisionConflict) {
+		t.Fatalf("conflict recovery err=%v", err)
+	}
+	*now = now.Add(25 * time.Hour)
+	if _, err := provisioner.Recover(ctx, "idem-recover", request); !errors.Is(err, ErrUnaRecoveryExpired) {
+		t.Fatalf("expired recovery err=%v", err)
+	}
+	if err := db.Model(&model.Token{}).Count(&tokenCount).Error; err != nil || tokenCount != 1 {
+		t.Fatalf("recover-only token count=%d err=%v", tokenCount, err)
 	}
 }
 

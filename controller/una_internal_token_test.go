@@ -52,12 +52,17 @@ func setupUnaInternalControllerTest(t *testing.T) (*gin.Engine, *gorm.DB, string
 	route := router.Group("/api/una/internal")
 	route.Use(middleware.UnaInternalAuth())
 	route.POST("/tokens", UnaInternalCreateToken)
+	route.POST("/tokens/recover", UnaInternalRecoverToken)
 	route.POST("/tokens/:id/disable", UnaInternalDisableToken)
 	return router, db, machineToken
 }
 
 func performUnaInternalRequest(router http.Handler, machineToken, idempotencyKey, body string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodPost, "/api/una/internal/tokens", strings.NewReader(body))
+	return performUnaInternalRequestAt(router, machineToken, idempotencyKey, "/api/una/internal/tokens", body)
+}
+
+func performUnaInternalRequestAt(router http.Handler, machineToken, idempotencyKey, path, body string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+machineToken)
 	request.Header.Set("Idempotency-Key", idempotencyKey)
@@ -105,8 +110,40 @@ func TestUnaInternalCreateTokenHTTPContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	expired := performUnaInternalRequest(router, machineToken, "http-idem", body)
-	if expired.Code != http.StatusGone || strings.Contains(expired.Body.String(), rawKey) {
+	if expired.Code != http.StatusGone || strings.Contains(expired.Body.String(), rawKey) || !strings.Contains(expired.Body.String(), `"external_id":`) || !strings.Contains(expired.Body.String(), `"error_code":"UNA_TOKEN_RECOVERY_EXPIRED"`) {
 		t.Fatalf("expired status=%d body=%s", expired.Code, expired.Body.String())
+	}
+}
+
+func TestUnaInternalRecoverTokenHTTPContract(t *testing.T) {
+	router, db, machineToken := setupUnaInternalControllerTest(t)
+	body := `{"owner_user_id":7,"name":"Una key","quota":123,"status":1}`
+
+	missing := performUnaInternalRequestAt(router, machineToken, "recover-missing", "/api/una/internal/tokens/recover", body)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status=%d body=%s", missing.Code, missing.Body.String())
+	}
+	var tokenCount int64
+	if err := db.Model(&model.Token{}).Count(&tokenCount).Error; err != nil || tokenCount != 0 {
+		t.Fatalf("recover-only created token: count=%d err=%v", tokenCount, err)
+	}
+
+	created := performUnaInternalRequest(router, machineToken, "recover-existing", body)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var first map[string]any
+	if err := json.Unmarshal(created.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	recovered := performUnaInternalRequestAt(router, machineToken, "recover-existing", "/api/una/internal/tokens/recover", body)
+	if recovered.Code != http.StatusOK || !strings.Contains(recovered.Body.String(), first["raw_key"].(string)) || !strings.Contains(recovered.Body.String(), `"replayed":true`) {
+		t.Fatalf("recover status=%d body=%s", recovered.Code, recovered.Body.String())
+	}
+
+	conflict := performUnaInternalRequestAt(router, machineToken, "recover-existing", "/api/una/internal/tokens/recover", `{"owner_user_id":7,"name":"different","quota":123,"status":1}`)
+	if conflict.Code != http.StatusConflict || strings.Contains(conflict.Body.String(), first["raw_key"].(string)) {
+		t.Fatalf("conflict status=%d body=%s", conflict.Code, conflict.Body.String())
 	}
 }
 
