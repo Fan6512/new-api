@@ -13,5 +13,7 @@ func registerUnaInternalRoutes(apiRouter *gin.RouterGroup) {
 		route.POST("/tokens", controller.UnaInternalCreateToken)
 		route.POST("/tokens/recover", controller.UnaInternalRecoverToken)
 		route.POST("/tokens/:id/disable", controller.UnaInternalDisableToken)
+		route.PUT("/channels", controller.UnaInternalApplyChannel)
+		route.GET("/logs", controller.UnaInternalListBillingLogs)
 	}
 }
