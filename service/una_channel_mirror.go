@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,13 +14,14 @@ import (
 	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
-const UnaChannelMirrorContractVersion = "una-channel-mirror.v1"
+const UnaChannelMirrorContractVersion = "una-channel-mirror.v2"
 
 var (
 	ErrUnaChannelMirrorInvalid  = errors.New("una channel mirror request invalid")
@@ -29,6 +31,17 @@ var (
 type UnaChannelMirrorService struct {
 	DB  *gorm.DB
 	Now func() time.Time
+}
+
+type unaChannelSettings struct {
+	Group string `json:"group"`
+}
+
+type unaChannelMetadata struct {
+	Provider       string          `json:"provider"`
+	AdapterType    string          `json:"adapter_type"`
+	DesiredVersion uint64          `json:"desired_version"`
+	Settings       json.RawMessage `json:"settings"`
 }
 
 func NewUnaChannelMirrorService() (*UnaChannelMirrorService, error) {
@@ -46,18 +59,15 @@ func (s *UnaChannelMirrorService) Apply(ctx context.Context, req dto.UnaChannelM
 	if s == nil || s.DB == nil || s.Now == nil {
 		return dto.UnaChannelMirrorResponse{}, errors.New("una channel mirror service is not configured")
 	}
-
 	fingerprint, err := unaChannelMirrorFingerprint(req)
 	if err != nil {
 		return dto.UnaChannelMirrorResponse{}, err
 	}
-	channelID := int(*req.ChannelID)
-	response := dto.UnaChannelMirrorResponse{
-		ContractVersion: UnaChannelMirrorContractVersion,
-		ChannelID:       *req.ChannelID,
-		DesiredVersion:  req.DesiredVersion,
+	settings, metadata, err := decodeUnaChannelSettings(req)
+	if err != nil {
+		return dto.UnaChannelMirrorResponse{}, err
 	}
-
+	response := dto.UnaChannelMirrorResponse{ContractVersion: UnaChannelMirrorContractVersion, DesiredVersion: req.DesiredVersion}
 	changed := false
 	err = s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing model.UnaChannelMirror
@@ -65,36 +75,58 @@ func (s *UnaChannelMirrorService) Apply(ctx context.Context, req dto.UnaChannelM
 		switch {
 		case findErr == nil:
 			if req.DesiredVersion < existing.DesiredVersion {
-				// 陈旧版本只确认 no-op，不能回滚已经应用的新版本。
 				response.ChannelID = uint64(existing.ChannelID)
 				return nil
 			}
 			if req.DesiredVersion == existing.DesiredVersion {
-				if existing.RequestFingerprint != fingerprint || existing.ChannelID != channelID {
+				if existing.RequestFingerprint != fingerprint || (req.ChannelID != nil && existing.ChannelID != int(*req.ChannelID)) {
 					return ErrUnaChannelMirrorConflict
 				}
+				response.ChannelID = uint64(existing.ChannelID)
 				return nil
-			}
-			if existing.ChannelID != channelID {
-				// 切换物理渠道必须创建新的 mapping，避免一次请求跨渠道修改两套能力。
-				return ErrUnaChannelMirrorConflict
 			}
 		case errors.Is(findErr, gorm.ErrRecordNotFound):
 		default:
 			return findErr
 		}
 
-		var channel model.Channel
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&channel, "id = ?", channelID).Error; err != nil {
-			return err
+		channelID := 0
+		if req.ChannelID != nil {
+			channelID = int(*req.ChannelID)
+		} else if findErr == nil {
+			channelID = existing.ChannelID
 		}
-
+		if findErr == nil && existing.ChannelID != channelID {
+			return ErrUnaChannelMirrorConflict
+		}
+		now := s.Now().UTC().Unix()
+		var channel model.Channel
+		if channelID == 0 {
+			channel = model.Channel{
+				Type: constant.ChannelTypeOpenAI, Key: req.Credential, Name: req.ChannelName,
+				Status: common.ChannelStatusManuallyDisabled, Weight: uintPointer(uint(req.Weight)),
+				CreatedTime: now, BaseURL: stringPointer(req.BaseURL), Models: "", Group: settings.Group,
+				Priority: int64Pointer(req.Priority), AutoBan: intPointer(1), OtherInfo: metadata,
+			}
+			if err := tx.Create(&channel).Error; err != nil {
+				return err
+			}
+			channelID = channel.Id
+		} else {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&channel, "id = ?", channelID).Error; err != nil {
+				return err
+			}
+			channel.Type, channel.Key, channel.Name = constant.ChannelTypeOpenAI, req.Credential, req.ChannelName
+			channel.BaseURL, channel.Weight, channel.Priority, channel.Group, channel.OtherInfo = stringPointer(req.BaseURL), uintPointer(uint(req.Weight)), int64Pointer(req.Priority), settings.Group, metadata
+			if err := tx.Model(&model.Channel{}).Where("id = ?", channelID).Select("type", "key", "name", "base_url", "weight", "priority", "group", "other_info").Updates(&channel).Error; err != nil {
+				return err
+			}
+		}
+		response.ChannelID = uint64(channelID)
 		var before []model.UnaChannelMirror
 		if err := tx.Where("channel_id = ?", channelID).Find(&before).Error; err != nil {
 			return err
 		}
-
-		now := s.Now().UTC().Unix()
 		record := model.UnaChannelMirror{
 			MappingID: req.MappingID, ChannelID: channelID, Model: req.Model,
 			ChannelName: req.ChannelName, UpstreamModel: req.UpstreamModel,
@@ -103,18 +135,15 @@ func (s *UnaChannelMirrorService) Apply(ctx context.Context, req dto.UnaChannelM
 			CreatedTime: now, UpdatedTime: now,
 		}
 		if findErr == nil {
-			record.ID = existing.ID
-			record.CreatedTime = existing.CreatedTime
+			record.ID, record.CreatedTime = existing.ID, existing.CreatedTime
 			if err := tx.Model(&model.UnaChannelMirror{}).Where("id = ?", existing.ID).Select(
-				"model", "channel_name", "upstream_model", "priority", "weight", "enabled",
-				"desired_version", "request_fingerprint", "updated_time",
+				"model", "channel_name", "upstream_model", "priority", "weight", "enabled", "desired_version", "request_fingerprint", "updated_time",
 			).Updates(&record).Error; err != nil {
 				return err
 			}
 		} else if err := tx.Create(&record).Error; err != nil {
 			return err
 		}
-
 		var after []model.UnaChannelMirror
 		if err := tx.Where("channel_id = ?", channelID).Order("mapping_id ASC").Find(&after).Error; err != nil {
 			return err
@@ -127,20 +156,12 @@ func (s *UnaChannelMirrorService) Apply(ctx context.Context, req dto.UnaChannelM
 		if err != nil {
 			return err
 		}
-		status := channel.Status
-
+		status := common.ChannelStatusManuallyDisabled
 		if hasEnabledUnaMirror(after) {
 			status = common.ChannelStatusEnabled
-		} else if strings.TrimSpace(models) == "" {
-			status = common.ChannelStatusManuallyDisabled
 		}
-		channel.Name = req.ChannelName
-		channel.Models = models
-		channel.ModelMapping = stringPointer(string(mappingJSON))
-		channel.Status = status
-		if err := tx.Model(&model.Channel{}).Where("id = ?", channelID).Select(
-			"name", "models", "model_mapping", "status",
-		).Updates(&channel).Error; err != nil {
+		channel.Models, channel.ModelMapping, channel.Status = models, stringPointer(string(mappingJSON)), status
+		if err := tx.Model(&model.Channel{}).Where("id = ?", channelID).Select("models", "model_mapping", "status").Updates(&channel).Error; err != nil {
 			return err
 		}
 		if err := rebuildUnaManagedAbilities(tx, channel, before, after); err != nil {
@@ -160,29 +181,53 @@ func (s *UnaChannelMirrorService) Apply(ctx context.Context, req dto.UnaChannelM
 }
 
 func normalizeUnaChannelMirrorRequest(req dto.UnaChannelMirrorRequest) dto.UnaChannelMirrorRequest {
-	req.ContractVersion = strings.TrimSpace(req.ContractVersion)
-	req.MappingID = strings.TrimSpace(req.MappingID)
-	req.Model = strings.TrimSpace(req.Model)
-	req.ChannelName = strings.TrimSpace(req.ChannelName)
-	req.UpstreamModel = strings.TrimSpace(req.UpstreamModel)
-	req.CostRatio = strings.TrimSpace(req.CostRatio)
+	req.ContractVersion, req.MappingID, req.Model = strings.TrimSpace(req.ContractVersion), strings.TrimSpace(req.MappingID), strings.TrimSpace(req.Model)
+	req.ChannelName, req.Provider, req.AdapterType = strings.TrimSpace(req.ChannelName), strings.ToLower(strings.TrimSpace(req.Provider)), strings.ToLower(strings.TrimSpace(req.AdapterType))
+	req.BaseURL, req.Credential, req.UpstreamModel, req.CostRatio = strings.TrimRight(strings.TrimSpace(req.BaseURL), "/"), strings.TrimSpace(req.Credential), strings.TrimSpace(req.UpstreamModel), strings.TrimSpace(req.CostRatio)
 	return req
 }
 
 func validateUnaChannelMirrorRequest(req dto.UnaChannelMirrorRequest) error {
-	if req.ContractVersion != UnaChannelMirrorContractVersion || req.DesiredVersion == 0 || req.ChannelID == nil || *req.ChannelID == 0 || *req.ChannelID > uint64(^uint(0) >> 1) {
+	if req.ContractVersion != UnaChannelMirrorContractVersion || req.DesiredVersion == 0 || req.ChannelDesiredVersion == 0 || (req.ChannelID != nil && (*req.ChannelID == 0 || *req.ChannelID > uint64(^uint(0)>>1))) {
 		return ErrUnaChannelMirrorInvalid
 	}
-	if !validUnaText(req.MappingID, 64) || !validUnaText(req.Model, 100) || !validUnaText(req.ChannelName, 100) || !validUnaText(req.UpstreamModel, 150) {
+	if !validUnaText(req.MappingID, 64) || !validUnaText(req.Model, 100) || !validUnaText(req.ChannelName, 100) || !validUnaText(req.Provider, 50) || req.AdapterType != "openai-compatible" || !validUnaText(req.UpstreamModel, 150) || len(req.Credential) == 0 || len(req.Credential) > 8192 {
 		return ErrUnaChannelMirrorInvalid
 	}
-	if strings.ContainsAny(req.Model, ",{}") || strings.ContainsAny(req.UpstreamModel, "{}") || req.Priority < 0 || req.Weight < 1 || uint64(req.Weight) > uint64(^uint(0)) {
+	if strings.ContainsAny(req.Model, ",{}") || strings.ContainsAny(req.UpstreamModel, "{}") || req.Priority < 0 || req.Weight < 1 || uint64(req.Weight) > uint64(^uint(0)) || !validUnaCostRatio(req.CostRatio) {
 		return ErrUnaChannelMirrorInvalid
 	}
-	if !validUnaCostRatio(req.CostRatio) {
+	target, err := url.Parse(req.BaseURL)
+	if err != nil || target.Hostname() == "" || (target.Scheme != "https" && target.Scheme != "http") || target.User != nil || target.RawQuery != "" || target.Fragment != "" {
+		return ErrUnaChannelMirrorInvalid
+	}
+	if len(req.Settings) == 0 || len(req.Settings) > 4096 || !json.Valid(req.Settings) {
+		return ErrUnaChannelMirrorInvalid
+	}
+	var object map[string]any
+	if json.Unmarshal(req.Settings, &object) != nil || object == nil {
 		return ErrUnaChannelMirrorInvalid
 	}
 	return nil
+}
+
+func decodeUnaChannelSettings(req dto.UnaChannelMirrorRequest) (unaChannelSettings, string, error) {
+	settings := unaChannelSettings{Group: "default"}
+	if err := json.Unmarshal(req.Settings, &settings); err != nil {
+		return unaChannelSettings{}, "", ErrUnaChannelMirrorInvalid
+	}
+	settings.Group = strings.TrimSpace(settings.Group)
+	if settings.Group == "" {
+		settings.Group = "default"
+	}
+	if !validUnaText(settings.Group, 64) || strings.ContainsAny(settings.Group, "{}") {
+		return unaChannelSettings{}, "", ErrUnaChannelMirrorInvalid
+	}
+	payload, err := json.Marshal(unaChannelMetadata{Provider: req.Provider, AdapterType: req.AdapterType, DesiredVersion: req.ChannelDesiredVersion, Settings: req.Settings})
+	if err != nil {
+		return unaChannelSettings{}, "", err
+	}
+	return settings, string(payload), nil
 }
 
 func validUnaText(value string, max int) bool {
@@ -216,8 +261,7 @@ func validUnaCostRatio(value string) bool {
 			return false
 		}
 	}
-	allZero := whole == 0 && strings.Trim(fraction, "0") == ""
-	return !allZero
+	return !(whole == 0 && strings.Trim(fraction, "0") == "")
 }
 
 func unaChannelMirrorFingerprint(req dto.UnaChannelMirrorRequest) (string, error) {
@@ -228,7 +272,6 @@ func unaChannelMirrorFingerprint(req dto.UnaChannelMirrorRequest) (string, error
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:]), nil
 }
-
 func mergeUnaManagedModels(currentModels, currentMapping string, before, after []model.UnaChannelMirror) (string, map[string]string, error) {
 	models := make(map[string]struct{})
 	for _, value := range strings.Split(currentModels, ",") {
@@ -314,3 +357,6 @@ func hasEnabledUnaMirror(values []model.UnaChannelMirror) bool {
 }
 
 func stringPointer(value string) *string { return &value }
+func uintPointer(value uint) *uint       { return &value }
+func int64Pointer(value int64) *int64    { return &value }
+func intPointer(value int) *int          { return &value }

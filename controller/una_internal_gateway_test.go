@@ -66,36 +66,31 @@ func performUnaGatewayRequest(router http.Handler, method, path, machineToken, b
 
 func TestUnaInternalChannelMirrorHTTPContract(t *testing.T) {
 	router, db, machineToken := setupUnaGatewayControllerTest(t)
-	weight := uint(1)
-	priority := int64(0)
-	mapping := `{}`
-	channel := model.Channel{
-		Type: 1, Key: "upstream-secret", Status: common.ChannelStatusManuallyDisabled,
-		Name: "preconfigured", Weight: &weight, Models: "legacy-model", Group: "default",
-		ModelMapping: &mapping, Priority: &priority,
-	}
-	if err := db.Create(&channel).Error; err != nil {
-		t.Fatal(err)
-	}
-	body := fmt.Sprintf(`{"contract_version":"una-channel-mirror.v1","mapping_id":"map-1","desired_version":1,"channel_id":%d,"model":"deepseek-v3","channel_name":"cmcc-primary","upstream_model":"DeepSeek-V3.1","priority":10,"weight":2,"cost_ratio":"1.0000","enabled":true}`, channel.Id)
+	body := `{"contract_version":"una-channel-mirror.v2","mapping_id":"map-1","desired_version":1,"channel_desired_version":1,"model":"deepseek-v3","channel_name":"cmcc-primary","provider":"cmcc","adapter_type":"openai-compatible","base_url":"https://api.example.com","settings":{"group":"default"},"credential":"upstream-secret","upstream_model":"DeepSeek-V3.1","priority":10,"weight":2,"cost_ratio":"1.0000","enabled":true}`
 
 	unauthorized := performUnaGatewayRequest(router, http.MethodPut, "/api/una/internal/channels", "", body)
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized status=%d", unauthorized.Code)
 	}
 	first := performUnaGatewayRequest(router, http.MethodPut, "/api/una/internal/channels", machineToken, body)
-	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"contract_version":"una-channel-mirror.v1"`) {
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"contract_version":"una-channel-mirror.v2"`) || strings.Contains(first.Body.String(), "upstream-secret") {
 		t.Fatalf("apply status=%d body=%s", first.Code, first.Body.String())
 	}
+	var response struct {
+		ChannelID int `json:"channel_id"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &response); err != nil || response.ChannelID <= 0 {
+		t.Fatalf("invalid response: %s err=%v", first.Body.String(), err)
+	}
 	var stored model.Channel
-	if err := db.First(&stored, channel.Id).Error; err != nil {
+	if err := db.First(&stored, response.ChannelID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stored.Key != "upstream-secret" || !strings.Contains(stored.Models, "deepseek-v3") || !strings.Contains(stored.GetModelMapping(), `"deepseek-v3":"DeepSeek-V3.1"`) {
+	if stored.Key != "upstream-secret" || stored.BaseURL == nil || *stored.BaseURL != "https://api.example.com" || !strings.Contains(stored.Models, "deepseek-v3") || !strings.Contains(stored.GetModelMapping(), `"deepseek-v3":"DeepSeek-V3.1"`) {
 		t.Fatalf("unexpected mirrored channel: %+v", stored)
 	}
 	var ability model.Ability
-	if err := db.Where("channel_id = ? AND model = ?", channel.Id, "deepseek-v3").First(&ability).Error; err != nil {
+	if err := db.Where("channel_id = ? AND model = ?", response.ChannelID, "deepseek-v3").First(&ability).Error; err != nil {
 		t.Fatal(err)
 	}
 	if ability.Priority == nil || *ability.Priority != 10 || ability.Weight != 2 || !ability.Enabled {
@@ -111,8 +106,15 @@ func TestUnaInternalChannelMirrorHTTPContract(t *testing.T) {
 	if conflict.Code != http.StatusConflict {
 		t.Fatalf("conflict status=%d body=%s", conflict.Code, conflict.Body.String())
 	}
+	rotatedBody := fmt.Sprintf(`{"contract_version":"una-channel-mirror.v2","mapping_id":"map-1","desired_version":2,"channel_desired_version":2,"channel_id":%d,"model":"deepseek-v3","channel_name":"cmcc-primary","provider":"cmcc","adapter_type":"openai-compatible","base_url":"https://api.example.com","settings":{"group":"default"},"credential":"rotated-secret","upstream_model":"DeepSeek-V3.1","priority":10,"weight":2,"cost_ratio":"1.0000","enabled":true}`, response.ChannelID)
+	rotated := performUnaGatewayRequest(router, http.MethodPut, "/api/una/internal/channels", machineToken, rotatedBody)
+	if rotated.Code != http.StatusOK || strings.Contains(rotated.Body.String(), "rotated-secret") {
+		t.Fatalf("rotate status=%d body=%s", rotated.Code, rotated.Body.String())
+	}
+	if err := db.First(&stored, response.ChannelID).Error; err != nil || stored.Key != "rotated-secret" {
+		t.Fatalf("credential rotation not applied: %+v err=%v", stored, err)
+	}
 }
-
 func TestUnaInternalBillingLogsHTTPContract(t *testing.T) {
 	router, db, machineToken := setupUnaGatewayControllerTest(t)
 	weight := uint(1)
