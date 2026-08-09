@@ -109,13 +109,14 @@ func (p *UnaTokenProvisioner) Create(ctx context.Context, idempotencyKey string,
 		if err != nil {
 			return errors.New("generate una token key")
 		}
-		body := "una-" + randomPart
+		// 持久化、恢复和对外交付必须使用同一份原始凭据，避免跨服务前缀漂移。
+		raw := "sk-una-" + randomPart
 		now := p.Now().UTC()
-		token := model.Token{UserId: req.OwnerUserID, Name: req.Name, Key: body, Status: req.Status, CreatedTime: now.Unix(), AccessedTime: now.Unix(), ExpiredTime: -1, RemainQuota: req.Quota, UnlimitedQuota: false}
+		token := model.Token{UserId: req.OwnerUserID, Name: req.Name, Key: raw, Status: req.Status, CreatedTime: now.Unix(), AccessedTime: now.Unix(), ExpiredTime: -1, RemainQuota: req.Quota, UnlimitedQuota: false}
 		if err := tx.Create(&token).Error; err != nil {
 			return err
 		}
-		nonce, ciphertext, err := p.encrypt(body, idempotencyKey, fingerprint, token.Id)
+		nonce, ciphertext, err := p.encrypt(raw, idempotencyKey, fingerprint, token.Id)
 		if err != nil {
 			return err
 		}
@@ -183,11 +184,10 @@ func (p *UnaTokenProvisioner) replayWithFlag(provision model.UnaTokenProvision, 
 	if p.Now().UTC().Unix() > provision.RecoverableUntil {
 		return dto.UnaTokenProvisionResponse{}, &UnaRecoveryExpiredError{ExternalID: strconv.Itoa(provision.TokenId)}
 	}
-	body, err := p.decrypt(provision)
+	raw, err := p.decrypt(provision)
 	if err != nil {
 		return dto.UnaTokenProvisionResponse{}, errors.New("decrypt una token recovery material")
 	}
-	raw := "sk-" + body
 	prefixLen := 12
 	if len(raw) < prefixLen {
 		prefixLen = len(raw)

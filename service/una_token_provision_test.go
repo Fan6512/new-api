@@ -91,8 +91,16 @@ func TestUnaTokenProvisionCreateAndReplay(t *testing.T) {
 	if err := db.First(&token).Error; err != nil {
 		t.Fatal(err)
 	}
-	if token.Key != strings.TrimPrefix(first.RawKey, "sk-") || !strings.HasPrefix(token.Key, "una-") {
+	if token.Key != first.RawKey || !strings.HasPrefix(token.Key, "sk-una-") {
 		t.Fatalf("stored key %q does not match raw-key contract", token.Key)
+	}
+	var provision model.UnaTokenProvision
+	if err := db.First(&provision).Error; err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := provisioner.decrypt(provision)
+	if err != nil || recovered != first.RawKey {
+		t.Fatalf("recovery material does not match raw key contract: err=%v", err)
 	}
 }
 
