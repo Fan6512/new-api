@@ -253,8 +253,6 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 			key = strings.TrimSpace(key[7:])
 		}
 		key = strings.TrimPrefix(key, "sk-")
-		parts := strings.Split(key, "-")
-		key = parts[0]
 
 		token, err := model.GetTokenByKey(key, false)
 		if err != nil {
@@ -360,12 +358,8 @@ func TokenAuth() func(c *gin.Context) {
 				key = strings.TrimSpace(key[7:])
 			}
 			key = strings.TrimPrefix(key, "sk-")
-			parts = strings.Split(key, "-")
-			key = parts[0]
 		} else {
 			key = strings.TrimPrefix(key, "sk-")
-			parts = strings.Split(key, "-")
-			key = parts[0]
 		}
 		token, err := model.ValidateUserToken(key)
 		if token != nil {

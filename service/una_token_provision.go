@@ -111,8 +111,9 @@ func (p *UnaTokenProvisioner) Create(ctx context.Context, idempotencyKey string,
 		}
 		// 持久化、恢复和对外交付必须使用同一份原始凭据，避免跨服务前缀漂移。
 		raw := "sk-una-" + randomPart
+		storageKey := strings.TrimPrefix(raw, "sk-")
 		now := p.Now().UTC()
-		token := model.Token{UserId: req.OwnerUserID, Name: req.Name, Key: raw, Status: req.Status, CreatedTime: now.Unix(), AccessedTime: now.Unix(), ExpiredTime: -1, RemainQuota: req.Quota, UnlimitedQuota: false}
+		token := model.Token{UserId: req.OwnerUserID, Name: req.Name, Key: storageKey, Status: req.Status, CreatedTime: now.Unix(), AccessedTime: now.Unix(), ExpiredTime: -1, RemainQuota: req.Quota, UnlimitedQuota: false}
 		if err := tx.Create(&token).Error; err != nil {
 			return err
 		}
